@@ -2,6 +2,8 @@
 
 An async TCP multiplexer that lets multiple client applications share a single [MeshCore](https://meshcore.co.uk) WiFi companion radio simultaneously.
 
+Inspired by [do6uk/meshcore_multitcp](https://github.com/do6uk/meshcore_multitcp).
+
 ## Problem
 
 MeshCore companion radios connected over TCP accept only one client at a time. This multiplexer sits between the companion and your clients, forwarding frames in both directions — any number of clients can connect concurrently.
@@ -38,10 +40,33 @@ MeshCore companion radios connected over TCP accept only one client at a time. T
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.10+, **or** Docker
 - A MeshCore companion radio with WiFi firmware and TCP enabled
 
 ## Usage
+
+### Docker (recommended)
+
+Pre-built multi-arch images (`linux/amd64`, `linux/arm64`) are published to the GitHub Container Registry on every push to `main` and on version tags.
+
+```bash
+# Pull and run (replace args as needed)
+docker run --rm ghcr.io/atulrnt/meshcore-tcp-multiplexer \
+    --companion-host 192.168.1.50 \
+    --companion-port 5000 \
+    --listen-port 5001
+
+# With store-and-forward (mount a volume so the DB persists)
+docker run --rm \
+    -v $(pwd)/data:/data \
+    -p 5001:5001 \
+    ghcr.io/atulrnt/meshcore-tcp-multiplexer \
+    --companion-host 192.168.1.50 \
+    --listen-port 5001 \
+    --store /data/messages.db
+```
+
+### From source
 
 ```bash
 python main.py [OPTIONS]
