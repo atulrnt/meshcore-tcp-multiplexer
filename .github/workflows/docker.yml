@@ -56,3 +56,11 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Delete untagged images
+        if: github.event_name != 'pull_request'
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: meshcore-tcp-multiplexer
+          package-type: container
+          delete-only-untagged-versions: true
