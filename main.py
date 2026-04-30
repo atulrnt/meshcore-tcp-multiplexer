@@ -1,28 +1,54 @@
 import argparse
 import asyncio
 import logging
+import os
 
 from mux import MeshCoreMux
 from store import MessageStore
+
+_TRUTHY = {"1", "true", "yes"}
+
+
+def _env_bool(name: str) -> bool:
+    return os.environ.get(name, "").lower() in _TRUTHY
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="MeshCore WiFi companion TCP multiplexer"
     )
-    parser.add_argument("--companion-host", default="127.0.0.1", metavar="HOST")
-    parser.add_argument("--companion-port", type=int, default=5000, metavar="PORT")
-    parser.add_argument("--listen-host", default="0.0.0.0", metavar="HOST")
-    parser.add_argument("--listen-port", type=int, default=5001, metavar="PORT")
+    parser.add_argument(
+        "--companion-host",
+        default=os.environ.get("COMPANION_HOST", "127.0.0.1"),
+        metavar="HOST",
+    )
+    parser.add_argument(
+        "--companion-port",
+        type=int,
+        default=int(os.environ.get("COMPANION_PORT", 5000)),
+        metavar="PORT",
+    )
+    parser.add_argument(
+        "--listen-host",
+        default=os.environ.get("LISTEN_HOST", "0.0.0.0"),
+        metavar="HOST",
+    )
+    parser.add_argument(
+        "--listen-port",
+        type=int,
+        default=int(os.environ.get("LISTEN_PORT", 5001)),
+        metavar="PORT",
+    )
     parser.add_argument(
         "--queue-depth",
         type=int,
-        default=256,
+        default=int(os.environ.get("QUEUE_DEPTH", 256)),
         metavar="N",
         help="max queued frames before oldest is dropped (default: 256)",
     )
     parser.add_argument(
         "--store",
+        default=os.environ.get("STORE"),
         metavar="FILE",
         help="enable store-and-forward using FILE as the SQLite database "
              "(e.g. --store messages.db). When set, private and channel "
@@ -31,7 +57,10 @@ def main() -> None:
              "since their last session before live forwarding resumes.",
     )
     parser.add_argument(
-        "--debug", action="store_true", help="enable debug frame logging"
+        "--debug",
+        action="store_true",
+        default=_env_bool("DEBUG"),
+        help="enable debug frame logging",
     )
     args = parser.parse_args()
 
