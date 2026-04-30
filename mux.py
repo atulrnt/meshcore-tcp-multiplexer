@@ -2,8 +2,12 @@ import asyncio
 import logging
 
 from framing import COMPANION_START, CLIENT_START, read_frame
+from store import MessageStore, STORABLE_TYPES
 
 log = logging.getLogger(__name__)
+
+# Client → companion command types
+_CMD_SYNC_NEXT = 10  # SYNC_NEXT_MESSAGE — triggers stored-message replay
 
 
 class MeshCoreMux:
@@ -14,11 +18,13 @@ class MeshCoreMux:
         listen_host: str,
         listen_port: int,
         queue_depth: int = 256,
+        store: MessageStore | None = None,
     ):
         self.companion_host = companion_host
         self.companion_port = companion_port
         self.listen_host = listen_host
         self.listen_port = listen_port
+        self._store = store
         self._clients: set[asyncio.StreamWriter] = set()
         self._write_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=queue_depth)
 
@@ -78,6 +84,8 @@ class MeshCoreMux:
         while True:
             frame = await read_frame(reader, COMPANION_START)
             log.debug("companion → clients: %d bytes", len(frame))
+            if self._store and len(frame) >= 4 and frame[3] in STORABLE_TYPES:
+                await self._store.store(frame[3], frame)
             await self._broadcast(frame)
 
     async def _companion_write_loop(self, writer: asyncio.StreamWriter) -> None:
@@ -94,14 +102,21 @@ class MeshCoreMux:
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         addr = writer.get_extra_info("peername")
+        client_ip = addr[0]
         log.info("client connected: %s", addr)
         self._clients.add(writer)
+        synced = False
         try:
             while True:
                 frame = await read_frame(reader, CLIENT_START)
                 log.debug("client %s → companion: %d bytes", addr, len(frame))
+
+                if self._store and len(frame) >= 4 and not synced:
+                    if frame[3] == _CMD_SYNC_NEXT:
+                        await self._replay_to_client(writer, client_ip)
+                        synced = True
+
                 if self._write_queue.full():
-                    # Drop oldest to prevent unbounded memory growth
                     try:
                         self._write_queue.get_nowait()
                         log.warning("write queue full, dropped oldest frame")
@@ -113,6 +128,19 @@ class MeshCoreMux:
         finally:
             self._clients.discard(writer)
             writer.close()
+
+    async def _replay_to_client(
+        self, writer: asyncio.StreamWriter, client_ip: str
+    ) -> None:
+        frames = await self._store.load_since(client_ip)  # type: ignore[union-attr]
+        if not frames:
+            log.info("store: no missed messages for %s", client_ip)
+            return
+        log.info("store: replaying %d message(s) to %s", len(frames), client_ip)
+        for frame in frames:
+            writer.write(frame)
+        await writer.drain()
+        await self._store.update_client(client_ip)  # type: ignore[union-attr]
 
     # ------------------------------------------------------------------
     # Broadcast to all clients in parallel
