@@ -52,10 +52,10 @@ def main() -> None:
         default=os.environ.get("STORE"),
         metavar="FILE",
         help="enable store-and-forward using FILE as the SQLite database "
-             "(e.g. --store messages.db). When set, private and channel "
-             "messages received from the companion are persisted; clients "
-             "that send SYNC_NEXT_MESSAGE receive any messages they missed "
-             "since their last session before live forwarding resumes.",
+        "(e.g. --store messages.db). When set, private and channel "
+        "messages received from the companion are persisted; clients "
+        "that send SYNC_NEXT_MESSAGE receive any messages they missed "
+        "since their last session before live forwarding resumes.",
     )
     parser.add_argument(
         "--beacon",
@@ -76,7 +76,7 @@ def main() -> None:
         default=os.environ.get("SAVE_TELEMETRY"),
         metavar="PUBKEY",
         help="fetch telemetry from the repeater with this public key "
-             "(64 hex characters = 32 bytes); use --telemetry-csv or --mqtt-host to store results",
+        "(64 hex characters = 32 bytes); use --telemetry-csv or --mqtt-host to store results",
     )
     parser.add_argument(
         "--telemetry-refresh",
@@ -139,7 +139,9 @@ def main() -> None:
         if len(args.save_telemetry) != 64 or not all(
             c in "0123456789abcdefABCDEF" for c in args.save_telemetry
         ):
-            parser.error("--save-telemetry must be exactly 64 hex characters (32-byte public key)")
+            parser.error(
+                "--save-telemetry must be exactly 64 hex characters (32-byte public key)"
+            )
         telemetry_pubkey = bytes.fromhex(args.save_telemetry)
         logging.getLogger(__name__).info(
             "telemetry enabled: pubkey=%s... refresh=%dm",

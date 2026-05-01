@@ -25,24 +25,30 @@ MeshCore companion radios connected over TCP accept only one client at a time. T
 - **Repeater telemetry** — periodic telemetry polling from a repeater node; results written to CSV and/or published to MQTT for Home Assistant
 - **Async I/O** — single-process, no thread contention, scales to many clients
 
-## Comparison with do6uk/meshcore_multitcp
-
-| | **This project** | do6uk/meshcore_multitcp |
-|---|---|---|
-| Architecture | `asyncio` (single process) | `threading` (one thread/client) |
-| Framing | Dedicated parser, resync on junk, partial-read safe | Single `recv(1024)` — breaks on partial reads |
-| Error handling | Typed exceptions, structured cleanup | 7 bare `except:` blocks |
-| Thread safety | N/A (async) | No locks on shared state |
-| Backpressure | Bounded queue, drop-oldest | None |
-| Type hints | 100% | ~10% |
-| Store & forward | Yes (SQLite, async, no SQL injection) | Yes (SQLite, sync, f-string queries) |
-| Systemd unit | Included | Included |
-
 ## Requirements
 
 - Python 3.10+, **or** Docker
 - A MeshCore companion radio with WiFi firmware and TCP enabled
 - `paho-mqtt>=2.0` (only needed when using `--mqtt-host`)
+
+## Development
+
+### Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+65 tests covering framing, store-and-forward, mux routing, telemetry parsing, and CLI argument handling. Integration tests use real in-process TCP.
+
+### Code style
+
+```bash
+black .
+```
+
+[Black](https://github.com/psf/black) is enforced at 88-char line length (the default).
 
 ## Usage
 

@@ -1,7 +1,7 @@
 import asyncio
 
 COMPANION_START = 0x3E  # companion → client frames
-CLIENT_START = 0x3C     # client → companion frames
+CLIENT_START = 0x3C  # client → companion frames
 MAX_PAYLOAD = 300
 
 

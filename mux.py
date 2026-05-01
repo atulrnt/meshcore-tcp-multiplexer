@@ -10,13 +10,13 @@ from telemetry import MqttPublisher
 log = logging.getLogger(__name__)
 
 # Client → companion command types
-_CMD_SYNC_NEXT = 10        # SYNC_NEXT_MESSAGE — triggers stored-message replay
-_CMD_GET_CHANNEL = 0x1F    # GET_CHANNEL — request channel name/PSK
+_CMD_SYNC_NEXT = 10  # SYNC_NEXT_MESSAGE — triggers stored-message replay
+_CMD_GET_CHANNEL = 0x1F  # GET_CHANNEL — request channel name/PSK
 _CMD_TELEMETRY_REQ = 0x27  # CMD_SEND_TELEMETRY_REQ — request repeater telemetry
 
 # Companion → client response types (consumed by mux, not forwarded)
 _RESP_CHANNEL_INFO = 0x12  # CHANNEL_INFO — response to GET_CHANNEL
-_RESP_TELEMETRY = 0x8B     # PUSH_CODE_TELEMETRY_RESPONSE — repeater telemetry
+_RESP_TELEMETRY = 0x8B  # PUSH_CODE_TELEMETRY_RESPONSE — repeater telemetry
 
 
 class MeshCoreMux:
@@ -104,7 +104,9 @@ class MeshCoreMux:
                 asyncio.create_task(self._companion_read_loop(reader)),
                 asyncio.create_task(self._companion_write_loop(writer)),
             ]
-            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+            done, pending = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_EXCEPTION
+            )
             for t in pending:
                 t.cancel()
                 try:
@@ -238,14 +240,18 @@ class MeshCoreMux:
     def _handle_telemetry_response(self, frame: bytes) -> None:
         # frame: [START 1B][len 2B][0x8B][reserved 1B][pubkey_prefix 6B][LPP data...]
         if len(frame) < 11:
-            log.warning("telemetry: response too short (%d bytes), ignoring", len(frame))
+            log.warning(
+                "telemetry: response too short (%d bytes), ignoring", len(frame)
+            )
             return
         pubkey_prefix = frame[5:11].hex()
         lpp_data = frame[11:]
         fields = telemetry_mod.parse_lpp(lpp_data)
         log.debug("telemetry: response from %s fields=%r", pubkey_prefix, fields)
         if self._telemetry_csv:
-            telemetry_mod.append_row(self._telemetry_csv, time.time(), pubkey_prefix, fields)
+            telemetry_mod.append_row(
+                self._telemetry_csv, time.time(), pubkey_prefix, fields
+            )
         if self._mqtt_publisher:
             self._mqtt_publisher.publish_telemetry(pubkey_prefix, fields)
         log.info("telemetry: stored %d field(s) from %s", len(fields), pubkey_prefix)
@@ -286,7 +292,9 @@ class MeshCoreMux:
         # CHANNEL_INFO payload: [0x12][idx][name 32B null-padded][psk 16B raw]
         # frame: [START][len 2B][payload...] → payload starts at frame[3]
         if len(frame) < 53:
-            log.warning("beacon: CHANNEL_INFO response too short (%d bytes)", len(frame))
+            log.warning(
+                "beacon: CHANNEL_INFO response too short (%d bytes)", len(frame)
+            )
             return
         idx = frame[4]
         name = frame[5:37].rstrip(b"\x00").decode("utf-8", errors="replace")
