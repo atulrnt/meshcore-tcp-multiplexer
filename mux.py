@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 
 from framing import COMPANION_START, CLIENT_START, read_frame
 from store import MessageStore, STORABLE_TYPES
@@ -7,7 +8,11 @@ from store import MessageStore, STORABLE_TYPES
 log = logging.getLogger(__name__)
 
 # Client → companion command types
-_CMD_SYNC_NEXT = 10  # SYNC_NEXT_MESSAGE — triggers stored-message replay
+_CMD_SYNC_NEXT = 10   # SYNC_NEXT_MESSAGE — triggers stored-message replay
+_CMD_GET_CHANNEL = 0x1F  # GET_CHANNEL — request channel name/PSK
+
+# Companion → client response types (consumed by mux, not forwarded)
+_RESP_CHANNEL_INFO = 0x12  # CHANNEL_INFO — response to GET_CHANNEL
 
 
 class MeshCoreMux:
@@ -19,12 +24,16 @@ class MeshCoreMux:
         listen_port: int,
         queue_depth: int = 256,
         store: MessageStore | None = None,
+        beacon: float | None = None,
+        beacon_channel: int = 0,
     ):
         self.companion_host = companion_host
         self.companion_port = companion_port
         self.listen_host = listen_host
         self.listen_port = listen_port
         self._store = store
+        self._beacon = beacon
+        self._beacon_channel = beacon_channel
         self._clients: set[asyncio.StreamWriter] = set()
         self._write_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=queue_depth)
 
@@ -35,7 +44,13 @@ class MeshCoreMux:
         addrs = ", ".join(str(s.getsockname()) for s in server.sockets)
         log.info("listening on %s", addrs)
         async with server:
-            await asyncio.gather(server.serve_forever(), self._companion_loop())
+            tasks: list[asyncio.Coroutine] = [
+                server.serve_forever(),
+                self._companion_loop(),
+            ]
+            if self._beacon:
+                tasks.append(self._beacon_loop())
+            await asyncio.gather(*tasks)
 
     # ------------------------------------------------------------------
     # Companion connection (with reconnect backoff)
@@ -63,6 +78,11 @@ class MeshCoreMux:
     async def _run_companion(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        if self._beacon:
+            try:
+                self._write_queue.put_nowait(self._build_get_channel_frame())
+            except asyncio.QueueFull:
+                log.warning("beacon: write queue full, skipping channel info query")
         tasks = [
             asyncio.create_task(self._companion_read_loop(reader)),
             asyncio.create_task(self._companion_write_loop(writer)),
@@ -84,6 +104,9 @@ class MeshCoreMux:
         while True:
             frame = await read_frame(reader, COMPANION_START)
             log.debug("companion → clients: %d bytes", len(frame))
+            if len(frame) >= 4 and frame[3] == _RESP_CHANNEL_INFO:
+                self._log_channel_info(frame)
+                continue  # consumed by mux; not a live message for clients
             if self._store and len(frame) >= 4 and frame[3] in STORABLE_TYPES:
                 await self._store.store(frame[3], frame)
             await self._broadcast(frame)
@@ -159,3 +182,49 @@ class MeshCoreMux:
             if isinstance(result, Exception):
                 self._clients.discard(w)
                 w.close()
+
+    # ------------------------------------------------------------------
+    # Beacon loop
+    # ------------------------------------------------------------------
+
+    async def _beacon_loop(self) -> None:
+        log.info(
+            "beacon enabled: channel=%d interval=%.1fs",
+            self._beacon_channel,
+            self._beacon,
+        )
+        while True:
+            await asyncio.sleep(self._beacon)
+            frame = self._build_channel_frame(
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            )
+            if self._write_queue.full():
+                try:
+                    self._write_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            await self._write_queue.put(frame)
+            log.debug("beacon: queued channel %d message", self._beacon_channel)
+
+    def _build_channel_frame(self, text: str) -> bytes:
+        ts = int(time.time()).to_bytes(4, "little")
+        payload = bytes([0x03, 0x00, self._beacon_channel]) + ts + text.encode()
+        return bytes([CLIENT_START]) + len(payload).to_bytes(2, "little") + payload
+
+    def _build_get_channel_frame(self) -> bytes:
+        payload = bytes([_CMD_GET_CHANNEL, self._beacon_channel])
+        return bytes([CLIENT_START]) + len(payload).to_bytes(2, "little") + payload
+
+    def _log_channel_info(self, frame: bytes) -> None:
+        # CHANNEL_INFO payload: [0x12][idx][name 32B null-padded][psk 16B raw]
+        # frame: [START][len 2B][payload...] → payload starts at frame[3]
+        if len(frame) < 53:
+            log.warning("beacon: CHANNEL_INFO response too short (%d bytes)", len(frame))
+            return
+        idx = frame[4]
+        name = frame[5:37].rstrip(b"\x00").decode("utf-8", errors="replace")
+        psk = frame[37:53].hex()
+        if name:
+            log.info("beacon channel %d: name=%r psk=%s", idx, name, psk)
+        else:
+            log.info("beacon channel %d: name=(none) psk=%s", idx, psk)

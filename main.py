@@ -57,6 +57,20 @@ def main() -> None:
              "since their last session before live forwarding resumes.",
     )
     parser.add_argument(
+        "--beacon",
+        type=float,
+        default=float(os.environ.get("BEACON", 0)) or None,
+        metavar="SECONDS",
+        help="send a channel message every SECONDS seconds (disabled if omitted)",
+    )
+    parser.add_argument(
+        "--beacon-channel",
+        type=int,
+        default=int(os.environ.get("BEACON_CHANNEL", 0)),
+        metavar="INDEX",
+        help="channel slot (0-7) to beacon on (default: 0 = public)",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         default=_env_bool("DEBUG"),
@@ -81,6 +95,8 @@ def main() -> None:
         listen_port=args.listen_port,
         queue_depth=args.queue_depth,
         store=store,
+        beacon=args.beacon,
+        beacon_channel=args.beacon_channel,
     )
 
     asyncio.run(mux.run())

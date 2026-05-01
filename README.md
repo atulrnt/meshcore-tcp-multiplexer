@@ -82,6 +82,8 @@ python main.py [OPTIONS]
 | `--listen-port PORT` | `5001` | TCP port to listen on |
 | `--queue-depth N` | `256` | Max queued frames before oldest is dropped |
 | `--store FILE` | off | Enable store-and-forward using FILE as SQLite DB |
+| `--beacon SECONDS` | off | Send a channel message every SECONDS seconds (`BEACON` env var) |
+| `--beacon-channel INDEX` | `0` | Channel slot (0–7) to beacon on; 0 = public (`BEACON_CHANNEL` env var) |
 | `--debug` | off | Enable verbose frame-level logging |
 
 ### Example
