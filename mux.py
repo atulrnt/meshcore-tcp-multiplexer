@@ -2,17 +2,20 @@ import asyncio
 import logging
 import time
 
+import telemetry as telemetry_mod
 from framing import COMPANION_START, CLIENT_START, read_frame
 from store import MessageStore, STORABLE_TYPES
 
 log = logging.getLogger(__name__)
 
 # Client → companion command types
-_CMD_SYNC_NEXT = 10   # SYNC_NEXT_MESSAGE — triggers stored-message replay
-_CMD_GET_CHANNEL = 0x1F  # GET_CHANNEL — request channel name/PSK
+_CMD_SYNC_NEXT = 10        # SYNC_NEXT_MESSAGE — triggers stored-message replay
+_CMD_GET_CHANNEL = 0x1F    # GET_CHANNEL — request channel name/PSK
+_CMD_TELEMETRY_REQ = 0x27  # CMD_SEND_TELEMETRY_REQ — request repeater telemetry
 
 # Companion → client response types (consumed by mux, not forwarded)
 _RESP_CHANNEL_INFO = 0x12  # CHANNEL_INFO — response to GET_CHANNEL
+_RESP_TELEMETRY = 0x8B     # PUSH_CODE_TELEMETRY_RESPONSE — repeater telemetry
 
 
 class MeshCoreMux:
@@ -26,6 +29,8 @@ class MeshCoreMux:
         store: MessageStore | None = None,
         beacon: float | None = None,
         beacon_channel: int = 0,
+        telemetry_pubkey: bytes | None = None,
+        telemetry_refresh: int = 300,
     ):
         self.companion_host = companion_host
         self.companion_port = companion_port
@@ -34,8 +39,11 @@ class MeshCoreMux:
         self._store = store
         self._beacon = beacon
         self._beacon_channel = beacon_channel
+        self._telemetry_pubkey = telemetry_pubkey
+        self._telemetry_refresh = telemetry_refresh
         self._clients: set[asyncio.StreamWriter] = set()
         self._write_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=queue_depth)
+        self._companion_ready: asyncio.Event = asyncio.Event()
 
     async def run(self) -> None:
         server = await asyncio.start_server(
@@ -50,6 +58,8 @@ class MeshCoreMux:
             ]
             if self._beacon:
                 tasks.append(self._beacon_loop())
+            if self._telemetry_pubkey:
+                tasks.append(self._telemetry_loop())
             await asyncio.gather(*tasks)
 
     # ------------------------------------------------------------------
@@ -78,32 +88,39 @@ class MeshCoreMux:
     async def _run_companion(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        if self._beacon:
-            try:
-                self._write_queue.put_nowait(self._build_get_channel_frame())
-            except asyncio.QueueFull:
-                log.warning("beacon: write queue full, skipping channel info query")
-        tasks = [
-            asyncio.create_task(self._companion_read_loop(reader)),
-            asyncio.create_task(self._companion_write_loop(writer)),
-        ]
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-        for t in pending:
-            t.cancel()
-            try:
-                await t
-            except (asyncio.CancelledError, Exception):
-                pass
-        writer.close()
-        for t in done:
-            exc = t.exception()
-            if exc:
-                raise exc
+        self._companion_ready.set()
+        try:
+            if self._beacon:
+                try:
+                    self._write_queue.put_nowait(self._build_get_channel_frame())
+                except asyncio.QueueFull:
+                    log.warning("beacon: write queue full, skipping channel info query")
+            tasks = [
+                asyncio.create_task(self._companion_read_loop(reader)),
+                asyncio.create_task(self._companion_write_loop(writer)),
+            ]
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+            for t in pending:
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+            writer.close()
+            for t in done:
+                exc = t.exception()
+                if exc:
+                    raise exc
+        finally:
+            self._companion_ready.clear()
 
     async def _companion_read_loop(self, reader: asyncio.StreamReader) -> None:
         while True:
             frame = await read_frame(reader, COMPANION_START)
             log.debug("companion → clients: %d bytes", len(frame))
+            if len(frame) >= 4 and frame[3] == _RESP_TELEMETRY:
+                self._handle_telemetry_response(frame)
+                continue
             if len(frame) >= 4 and frame[3] == _RESP_CHANNEL_INFO:
                 self._log_channel_info(frame)
                 continue  # consumed by mux; not a live message for clients
@@ -182,6 +199,48 @@ class MeshCoreMux:
             if isinstance(result, Exception):
                 self._clients.discard(w)
                 w.close()
+
+    # ------------------------------------------------------------------
+    # Telemetry loop
+    # ------------------------------------------------------------------
+
+    async def _telemetry_loop(self) -> None:
+        log.info(
+            "telemetry: pubkey=%s... refresh=%ds",
+            self._telemetry_pubkey.hex()[:12],  # type: ignore[union-attr]
+            self._telemetry_refresh,
+        )
+        while True:
+            await self._companion_ready.wait()
+            log.debug(
+                "telemetry: sending request to %s",
+                self._telemetry_pubkey.hex()[:12],  # type: ignore[union-attr]
+            )
+            frame = self._build_telemetry_req_frame()
+            if self._write_queue.full():
+                try:
+                    self._write_queue.get_nowait()
+                    log.warning("telemetry: write queue full, dropped oldest frame")
+                except asyncio.QueueEmpty:
+                    pass
+            await self._write_queue.put(frame)
+            await asyncio.sleep(self._telemetry_refresh)
+
+    def _build_telemetry_req_frame(self) -> bytes:
+        payload = bytes([_CMD_TELEMETRY_REQ, 0x00, 0x00, 0x00]) + self._telemetry_pubkey  # type: ignore[operator]
+        return bytes([CLIENT_START]) + len(payload).to_bytes(2, "little") + payload
+
+    def _handle_telemetry_response(self, frame: bytes) -> None:
+        # frame: [START 1B][len 2B][0x8B][reserved 1B][pubkey_prefix 6B][LPP data...]
+        if len(frame) < 11:
+            log.warning("telemetry: response too short (%d bytes), ignoring", len(frame))
+            return
+        pubkey_prefix = frame[5:11].hex()
+        lpp_data = frame[11:]
+        fields = telemetry_mod.parse_lpp(lpp_data)
+        log.debug("telemetry: response from %s fields=%r", pubkey_prefix, fields)
+        telemetry_mod.append_row("telemetry.csv", time.time(), pubkey_prefix, fields)
+        log.info("telemetry: stored %d field(s) from %s", len(fields), pubkey_prefix)
 
     # ------------------------------------------------------------------
     # Beacon loop

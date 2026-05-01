@@ -71,6 +71,20 @@ def main() -> None:
         help="channel slot (0-7) to beacon on (default: 0 = public)",
     )
     parser.add_argument(
+        "--save-telemetry",
+        default=os.environ.get("SAVE_TELEMETRY"),
+        metavar="PUBKEY",
+        help="fetch and store telemetry from the repeater with this public key "
+             "(64 hex characters = 32 bytes); written to telemetry.csv",
+    )
+    parser.add_argument(
+        "--telemetry-refresh",
+        type=int,
+        default=int(os.environ.get("TELEMETRY_REFRESH", 5)),
+        metavar="MINUTES",
+        help="how often to fetch telemetry, in minutes (default: 5)",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         default=_env_bool("DEBUG"),
@@ -88,6 +102,19 @@ def main() -> None:
     if store:
         logging.getLogger(__name__).info("store-and-forward enabled: %s", args.store)
 
+    telemetry_pubkey: bytes | None = None
+    if args.save_telemetry:
+        if len(args.save_telemetry) != 64 or not all(
+            c in "0123456789abcdefABCDEF" for c in args.save_telemetry
+        ):
+            parser.error("--save-telemetry must be exactly 64 hex characters (32-byte public key)")
+        telemetry_pubkey = bytes.fromhex(args.save_telemetry)
+        logging.getLogger(__name__).info(
+            "telemetry enabled: pubkey=%s... refresh=%dm",
+            args.save_telemetry[:12],
+            args.telemetry_refresh,
+        )
+
     mux = MeshCoreMux(
         companion_host=args.companion_host,
         companion_port=args.companion_port,
@@ -97,6 +124,8 @@ def main() -> None:
         store=store,
         beacon=args.beacon,
         beacon_channel=args.beacon_channel,
+        telemetry_pubkey=telemetry_pubkey,
+        telemetry_refresh=args.telemetry_refresh * 60,
     )
 
     asyncio.run(mux.run())
