@@ -5,6 +5,7 @@ import os
 
 from mux import MeshCoreMux
 from store import MessageStore
+from telemetry import MqttPublisher
 
 _TRUTHY = {"1", "true", "yes"}
 
@@ -74,8 +75,8 @@ def main() -> None:
         "--save-telemetry",
         default=os.environ.get("SAVE_TELEMETRY"),
         metavar="PUBKEY",
-        help="fetch and store telemetry from the repeater with this public key "
-             "(64 hex characters = 32 bytes); written to telemetry.csv",
+        help="fetch telemetry from the repeater with this public key "
+             "(64 hex characters = 32 bytes); use --telemetry-csv or --mqtt-host to store results",
     )
     parser.add_argument(
         "--telemetry-refresh",
@@ -83,6 +84,37 @@ def main() -> None:
         default=int(os.environ.get("TELEMETRY_REFRESH", 5)),
         metavar="MINUTES",
         help="how often to fetch telemetry, in minutes (default: 5)",
+    )
+    parser.add_argument(
+        "--telemetry-csv",
+        default=os.environ.get("TELEMETRY_CSV"),
+        metavar="FILE",
+        help="append telemetry rows to FILE in CSV format (e.g. telemetry.csv)",
+    )
+    parser.add_argument(
+        "--mqtt-host",
+        default=os.environ.get("MQTT_HOST"),
+        metavar="HOST",
+        help="MQTT broker hostname or IP; enables publishing telemetry to MQTT",
+    )
+    parser.add_argument(
+        "--mqtt-port",
+        type=int,
+        default=int(os.environ.get("MQTT_PORT", 1883)),
+        metavar="PORT",
+        help="MQTT broker port (default: 1883)",
+    )
+    parser.add_argument(
+        "--mqtt-user",
+        default=os.environ.get("MQTT_USER"),
+        metavar="USER",
+        help="MQTT username",
+    )
+    parser.add_argument(
+        "--mqtt-pass",
+        default=os.environ.get("MQTT_PASS"),
+        metavar="PASS",
+        help="MQTT password",
     )
     parser.add_argument(
         "--debug",
@@ -115,6 +147,20 @@ def main() -> None:
             args.telemetry_refresh,
         )
 
+    mqtt_publisher: MqttPublisher | None = None
+    if args.mqtt_host:
+        if not telemetry_pubkey:
+            logging.getLogger(__name__).warning(
+                "mqtt: --mqtt-host set but --save-telemetry not set; nothing will be published"
+            )
+        mqtt_publisher = MqttPublisher(
+            host=args.mqtt_host,
+            port=args.mqtt_port,
+            user=args.mqtt_user,
+            password=args.mqtt_pass,
+        )
+        mqtt_publisher.connect()
+
     mux = MeshCoreMux(
         companion_host=args.companion_host,
         companion_port=args.companion_port,
@@ -126,6 +172,8 @@ def main() -> None:
         beacon_channel=args.beacon_channel,
         telemetry_pubkey=telemetry_pubkey,
         telemetry_refresh=args.telemetry_refresh * 60,
+        telemetry_csv=args.telemetry_csv,
+        mqtt_publisher=mqtt_publisher,
     )
 
     asyncio.run(mux.run())

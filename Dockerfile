@@ -4,6 +4,9 @@ LABEL net.unraid.docker.icon="https://github.com/atulrnt/meshcore-tcp-multiplexe
 
 WORKDIR /app
 
-COPY framing.py mux.py store.py main.py ./
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY framing.py mux.py store.py telemetry.py main.py ./
 
 ENTRYPOINT ["python", "main.py"]

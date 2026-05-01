@@ -5,6 +5,7 @@ import time
 import telemetry as telemetry_mod
 from framing import COMPANION_START, CLIENT_START, read_frame
 from store import MessageStore, STORABLE_TYPES
+from telemetry import MqttPublisher
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +32,8 @@ class MeshCoreMux:
         beacon_channel: int = 0,
         telemetry_pubkey: bytes | None = None,
         telemetry_refresh: int = 300,
+        telemetry_csv: str | None = None,
+        mqtt_publisher: MqttPublisher | None = None,
     ):
         self.companion_host = companion_host
         self.companion_port = companion_port
@@ -41,6 +44,8 @@ class MeshCoreMux:
         self._beacon_channel = beacon_channel
         self._telemetry_pubkey = telemetry_pubkey
         self._telemetry_refresh = telemetry_refresh
+        self._telemetry_csv = telemetry_csv
+        self._mqtt_publisher = mqtt_publisher
         self._clients: set[asyncio.StreamWriter] = set()
         self._write_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=queue_depth)
         self._companion_ready: asyncio.Event = asyncio.Event()
@@ -239,7 +244,10 @@ class MeshCoreMux:
         lpp_data = frame[11:]
         fields = telemetry_mod.parse_lpp(lpp_data)
         log.debug("telemetry: response from %s fields=%r", pubkey_prefix, fields)
-        telemetry_mod.append_row("telemetry.csv", time.time(), pubkey_prefix, fields)
+        if self._telemetry_csv:
+            telemetry_mod.append_row(self._telemetry_csv, time.time(), pubkey_prefix, fields)
+        if self._mqtt_publisher:
+            self._mqtt_publisher.publish_telemetry(pubkey_prefix, fields)
         log.info("telemetry: stored %d field(s) from %s", len(fields), pubkey_prefix)
 
     # ------------------------------------------------------------------
