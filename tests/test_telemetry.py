@@ -1,9 +1,10 @@
 import csv
+import json
 import os
 import tempfile
 import unittest
 
-from telemetry import append_row, parse_lpp
+from telemetry import MqttPublisher, append_row, parse_lpp
 
 
 def _signed_be(value: int, size: int) -> bytes:
@@ -149,3 +150,52 @@ class TestAppendRow(unittest.TestCase):
         with open(self.csv_path) as f:
             rows = list(csv.DictReader(f))
         self.assertEqual(rows[1]["humidity_pct_ch0"], "")
+
+
+class FakeMqttClient:
+    def __init__(self):
+        self.published = []
+
+    def publish(self, topic, payload, qos=0, retain=False):
+        self.published.append((topic, payload, qos, retain))
+
+
+class TestMqttPublisher(unittest.TestCase):
+    def test_publish_telemetry_uses_single_json_topic(self):
+        publisher = MqttPublisher.__new__(MqttPublisher)
+        publisher._client = FakeMqttClient()
+        publisher._discovered = set()
+
+        publisher.publish_telemetry(
+            "aabbccdd",
+            {"temperature_c_ch0": 20.2, "battery_v_ch1": 4.11},
+        )
+
+        state_messages = [
+            msg
+            for msg in publisher._client.published
+            if msg[0] == "meshcore/aabbccdd/telemetry"
+        ]
+        self.assertEqual(len(state_messages), 1)
+        topic, payload, qos, retain = state_messages[0]
+        self.assertEqual(topic, "meshcore/aabbccdd/telemetry")
+        self.assertEqual(
+            json.loads(payload),
+            {"temperature_c_ch0": 20.2, "battery_v_ch1": 4.11},
+        )
+        self.assertEqual(qos, 1)
+        self.assertTrue(retain)
+
+    def test_discovery_reads_field_from_json_topic(self):
+        publisher = MqttPublisher.__new__(MqttPublisher)
+        publisher._client = FakeMqttClient()
+
+        publisher._publish_discovery("aabbccdd", "temperature_c_ch0")
+
+        topic, payload, qos, retain = publisher._client.published[0]
+        self.assertEqual(topic, "homeassistant/sensor/meshcore_aabbccdd_temperature_c_ch0/config")
+        self.assertEqual(qos, 1)
+        self.assertTrue(retain)
+        discovery = json.loads(payload)
+        self.assertEqual(discovery["state_topic"], "meshcore/aabbccdd/telemetry")
+        self.assertEqual(discovery["value_template"], "{{ value_json.temperature_c_ch0 }}")

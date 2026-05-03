@@ -116,14 +116,14 @@ class MqttPublisher:
         self._client.disconnect()
 
     def publish_telemetry(self, pubkey_prefix: str, fields: dict) -> None:
-        for field_name, value in fields.items():
+        for field_name in fields:
             disc_key = f"{pubkey_prefix}/{field_name}"
             if disc_key not in self._discovered:
                 self._publish_discovery(pubkey_prefix, field_name)
                 self._discovered.add(disc_key)
-            state_topic = f"meshcore/telemetry/{pubkey_prefix}/{field_name}"
-            self._client.publish(state_topic, str(value), qos=1, retain=True)
-            log.debug("mqtt: published %s = %s", state_topic, value)
+        state_topic = f"meshcore/{pubkey_prefix}/telemetry"
+        self._client.publish(state_topic, json.dumps(fields), qos=1, retain=True)
+        log.debug("mqtt: published %s = %r", state_topic, fields)
 
     def _publish_discovery(self, pubkey_prefix: str, field_name: str) -> None:
         ft = _field_type(field_name)
@@ -131,14 +131,15 @@ class MqttPublisher:
             ft, (field_name, None, None, None)
         )
 
-        unique_id = f"meshcore_{pubkey_prefix}_{field_name}"
-        state_topic = f"meshcore/telemetry/{pubkey_prefix}/{field_name}"
+            unique_id = f"meshcore_{pubkey_prefix}_{field_name}"
+        state_topic = f"meshcore/{pubkey_prefix}/telemetry"
         disc_topic = f"homeassistant/sensor/{unique_id}/config"
 
         payload: dict = {
             "name": human_name,
             "unique_id": unique_id,
             "state_topic": state_topic,
+            "value_template": f"{{{{ value_json.{field_name} }}}}",
             "device": {
                 "identifiers": [f"meshcore_{pubkey_prefix}"],
                 "name": f"MeshCore Repeater {pubkey_prefix}",
