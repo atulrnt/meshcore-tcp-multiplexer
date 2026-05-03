@@ -294,7 +294,27 @@ class TestMuxIntegration(unittest.IsolatedAsyncioTestCase):
         finally:
             writer.close()
 
-    async def test_channel_info_not_forwarded_to_client(self):
+    async def test_channel_info_forwarded_to_client_when_beacon_disabled(self):
+        reader, writer = await self._connect_client()
+        try:
+            name = b"TestChan\x00" + b"\x00" * 24
+            psk = b"\xab" * 16
+            payload = bytes([0x12, 0]) + name + psk
+            chan_frame = (
+                bytes([COMPANION_START]) + len(payload).to_bytes(2, "little") + payload
+            )
+
+            await self.companion.send(chan_frame)
+
+            received = await asyncio.wait_for(
+                read_frame(reader, COMPANION_START), timeout=2.0
+            )
+            self.assertEqual(received, chan_frame)
+        finally:
+            writer.close()
+
+    async def test_channel_info_not_forwarded_to_client_when_beacon_enabled(self):
+        self.mux._beacon = 60.0
         reader, writer = await self._connect_client()
         try:
             name = b"TestChan\x00" + b"\x00" * 24

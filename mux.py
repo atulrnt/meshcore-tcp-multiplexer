@@ -128,7 +128,7 @@ class MeshCoreMux:
             if len(frame) >= 4 and frame[3] == _RESP_TELEMETRY:
                 self._handle_telemetry_response(frame)
                 continue
-            if len(frame) >= 4 and frame[3] == _RESP_CHANNEL_INFO:
+            if self._beacon and len(frame) >= 4 and frame[3] == _RESP_CHANNEL_INFO:
                 self._log_channel_info(frame)
                 continue  # consumed by mux; not a live message for clients
             if self._store and len(frame) >= 4 and frame[3] in STORABLE_TYPES:

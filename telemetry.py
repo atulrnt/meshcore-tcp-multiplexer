@@ -131,7 +131,7 @@ class MqttPublisher:
             ft, (field_name, None, None, None)
         )
 
-            unique_id = f"meshcore_{pubkey_prefix}_{field_name}"
+        unique_id = f"meshcore_{pubkey_prefix}_{field_name}"
         state_topic = f"meshcore/{pubkey_prefix}/telemetry"
         disc_topic = f"homeassistant/sensor/{unique_id}/config"
 
