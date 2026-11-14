@@ -93,11 +93,14 @@ class MqttPublisher:
         port: int = 1883,
         user: str | None = None,
         password: str | None = None,
+        telemetry_refresh: int = 300,
     ) -> None:
+        # telemetry_refresh is in seconds; the default matches the CLI's 5 minutes.
         import paho.mqtt.client as mqtt
 
         self._host = host
         self._port = port
+        self._expire_after = telemetry_refresh * 3
         self._discovered: set[str] = set()
 
         self._client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
@@ -122,7 +125,7 @@ class MqttPublisher:
                 self._publish_discovery(pubkey_prefix, field_name)
                 self._discovered.add(disc_key)
         state_topic = f"meshcore/{pubkey_prefix}/telemetry"
-        self._client.publish(state_topic, json.dumps(fields), qos=1, retain=True)
+        self._client.publish(state_topic, json.dumps(fields), qos=1, retain=False)
         log.debug("mqtt: published %s = %r", state_topic, fields)
 
     def _publish_discovery(self, pubkey_prefix: str, field_name: str) -> None:
@@ -139,6 +142,7 @@ class MqttPublisher:
             "name": human_name,
             "unique_id": unique_id,
             "state_topic": state_topic,
+            "expire_after": self._expire_after,
             "value_template": f"{{{{ value_json.{field_name} }}}}",
             "device": {
                 "identifiers": [f"meshcore_{pubkey_prefix}"],

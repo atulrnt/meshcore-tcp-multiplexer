@@ -31,6 +31,24 @@ class TestEnvBool(unittest.TestCase):
 
 
 class TestArgParsing(unittest.TestCase):
+    def test_mqtt_refresh_interval_passed_in_seconds(self):
+        import main
+
+        for options, minutes in (([], 5), (["--telemetry-refresh", "7"], 7)):
+            with self.subTest(minutes=minutes), patch.dict(
+                os.environ, {}, clear=True
+            ), patch(
+                "sys.argv", ["main.py", "--mqtt-host", "broker.invalid"] + options
+            ), patch(
+                "main.MqttPublisher"
+            ) as publisher, patch(
+                "asyncio.run", side_effect=lambda c: c.close()
+            ):
+                main.main()
+                self.assertEqual(
+                    publisher.call_args.kwargs["telemetry_refresh"], minutes * 60
+                )
+
     def test_help_exits_zero(self):
         with patch("sys.argv", ["main.py", "--help"]):
             with self.assertRaises(SystemExit) as ctx:

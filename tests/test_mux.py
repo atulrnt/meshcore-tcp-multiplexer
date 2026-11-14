@@ -3,6 +3,7 @@ import os
 import socket
 import tempfile
 import unittest
+from unittest.mock import AsyncMock, Mock, patch
 
 from framing import CLIENT_START, COMPANION_START, read_frame
 from mux import MeshCoreMux
@@ -136,6 +137,105 @@ class TestResponseHandlers(unittest.TestCase):
         self.assertIn(b"frame3", items)
 
 
+class TestCompanionCleanup(unittest.IsolatedAsyncioTestCase):
+    async def test_read_failure_reaps_writer_and_closes_connection(self):
+        mux = _make_mux()
+        writer = Mock()
+        writer_started = asyncio.Event()
+        writer_stopped = asyncio.Event()
+
+        async def fail_read(_):
+            await writer_started.wait()
+            raise OSError("companion gone")
+
+        async def block_write(_):
+            writer_started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                writer_stopped.set()
+
+        with patch.object(
+            mux, "_companion_read_loop", side_effect=fail_read
+        ), patch.object(mux, "_companion_write_loop", side_effect=block_write):
+            with self.assertRaisesRegex(OSError, "companion gone"):
+                await asyncio.wait_for(mux._run_companion(Mock(), writer), timeout=1.0)
+        self.assertTrue(writer_stopped.is_set())
+        self.assertFalse(mux._companion_ready.is_set())
+        writer.close.assert_called_once()
+
+    async def test_cancellation_during_child_cleanup_propagates(self):
+        mux = _make_mux()
+        writer = Mock()
+        writer_started = asyncio.Event()
+        cleaning = asyncio.Event()
+        child_tasks = []
+
+        async def fail_read(_):
+            await writer_started.wait()
+            raise OSError("companion gone")
+
+        async def slow_cleanup(_):
+            child_tasks.append(asyncio.current_task())
+            writer_started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cleaning.set()
+                await asyncio.Future()
+
+        with patch.object(
+            mux, "_companion_read_loop", side_effect=fail_read
+        ), patch.object(mux, "_companion_write_loop", side_effect=slow_cleanup):
+            task = asyncio.create_task(mux._run_companion(Mock(), writer))
+            await asyncio.wait_for(cleaning.wait(), timeout=1.0)
+            task.cancel()
+            done, _ = await asyncio.wait([task], timeout=1.0)
+            self.assertIn(task, done, "cancellation during cleanup was swallowed")
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertTrue(all(child.done() for child in child_tasks))
+        self.assertFalse(mux._companion_ready.is_set())
+        writer.close.assert_called_once()
+
+
+class TestTelemetryPolling(unittest.IsolatedAsyncioTestCase):
+    async def test_warns_when_no_target_response_arrives(self):
+        mux = _make_mux(telemetry_pubkey=bytes(range(32)), telemetry_refresh=60)
+        mux._companion_ready.set()
+        with patch("mux.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            sleep.side_effect = [None, asyncio.CancelledError()]
+            with self.assertLogs("mux", level="WARNING") as logs:
+                with self.assertRaises(asyncio.CancelledError):
+                    await mux._telemetry_loop()
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("no response from 000102030405 within 60s", logs.output[0])
+        self.assertEqual(
+            mux._write_queue.get_nowait(), mux._build_telemetry_req_frame()
+        )
+
+    async def test_target_response_suppresses_missing_response_warning(self):
+        mux = _make_mux(telemetry_pubkey=bytes(range(32)), telemetry_refresh=60)
+        mux._companion_ready.set()
+        calls = 0
+
+        async def respond_then_cancel(_):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise asyncio.CancelledError()
+            mux._handle_telemetry_response(
+                _companion_frame(0x8B, b"\x00" + bytes(range(6)))
+            )
+
+        with patch("mux.asyncio.sleep", side_effect=respond_then_cancel), patch(
+            "mux.log.warning"
+        ) as warning:
+            with self.assertRaises(asyncio.CancelledError):
+                await mux._telemetry_loop()
+        warning.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Fake companion server
 # ---------------------------------------------------------------------------
@@ -164,6 +264,8 @@ class FakeCompanion:
         except Exception:
             pass
         finally:
+            writer.close()
+            await writer.wait_closed()
             if writer in self._writers:
                 self._writers.remove(writer)
 
@@ -272,27 +374,143 @@ class TestMuxIntegration(unittest.IsolatedAsyncioTestCase):
             w1.close()
             w2.close()
 
-    async def test_telemetry_response_not_forwarded_to_client(self):
-        reader, writer = await self._connect_client()
+    async def test_telemetry_response_processed_and_forwarded_to_all_clients(self):
+        r1, w1 = await self._connect_client()
+        r2, w2 = await asyncio.open_connection("127.0.0.1", self.listen_port)
         try:
-            pubkey = b"\x01\x02\x03\x04\x05\x06"
-            lpp = bytes([0x00, 0x67, 0x00, 0xFA])  # temp 25°C
-            payload = bytes([0x8B, 0x00]) + pubkey + lpp
-            telem_frame = (
-                bytes([COMPANION_START]) + len(payload).to_bytes(2, "little") + payload
+            deadline = asyncio.get_running_loop().time() + 2.0
+            while (
+                len(self.mux._clients) < 2
+                and asyncio.get_running_loop().time() < deadline
+            ):
+                await asyncio.sleep(0.005)
+            self.assertEqual(len(self.mux._clients), 2)
+            frame = _companion_frame(
+                0x8B, b"\x00\x01\x02\x03\x04\x05\x06\x00\x67\x00\xfa"
             )
-            regular_frame = _companion_frame(8, b"regular msg")
-
-            await self.companion.send(telem_frame)
-            await asyncio.sleep(0.05)
-            await self.companion.send(regular_frame)
-
-            received = await asyncio.wait_for(
-                read_frame(reader, COMPANION_START), timeout=2.0
+            publisher = Mock()
+            self.mux._mqtt_publisher = publisher
+            await self.companion.send(frame)
+            for reader in (r1, r2):
+                received = await asyncio.wait_for(
+                    read_frame(reader, COMPANION_START), timeout=2.0
+                )
+                self.assertEqual(received, frame)
+            publisher.publish_telemetry.assert_called_once_with(
+                "010203040506", {"temperature_c_ch0": 25.0}
             )
-            self.assertEqual(received, regular_frame)
+        finally:
+            w1.close()
+            w2.close()
+
+    async def test_telemetry_sink_failures_do_not_disconnect_companion(self):
+        reader, writer = await self._connect_client()
+        self.mux._telemetry_csv = "unused.csv"
+        publisher = Mock()
+        self.mux._mqtt_publisher = publisher
+        frame = _companion_frame(0x8B, b"\x00" + bytes(range(6)) + b"\x00\x67\x00\xfa")
+        regular_frame = _companion_frame(8, b"still connected")
+        try:
+            for csv_error, mqtt_error in (
+                (OSError("CSV unavailable"), None),
+                (None, RuntimeError("MQTT unavailable")),
+                (OSError("CSV unavailable"), RuntimeError("MQTT unavailable")),
+            ):
+                with self.subTest(csv_error=csv_error, mqtt_error=mqtt_error):
+                    publisher.reset_mock()
+                    publisher.publish_telemetry.side_effect = mqtt_error
+                    with patch(
+                        "mux.telemetry_mod.append_row", side_effect=csv_error
+                    ) as append:
+                        with self.assertLogs("mux", level="ERROR"):
+                            await self.companion.send(frame)
+                            await self.companion.send(regular_frame)
+                            for expected in (frame, regular_frame):
+                                received = await asyncio.wait_for(
+                                    read_frame(reader, COMPANION_START), timeout=2.0
+                                )
+                                self.assertEqual(received, expected)
+                        append.assert_called_once()
+                        publisher.publish_telemetry.assert_called_once()
+                        self.assertTrue(self.mux._companion_ready.is_set())
         finally:
             writer.close()
+
+    async def test_other_node_telemetry_forwarded_but_not_saved(self):
+        reader, writer = await self._connect_client()
+        self.mux._telemetry_pubkey = bytes(range(32))
+        self.mux._telemetry_csv = "unused.csv"
+        publisher = Mock()
+        self.mux._mqtt_publisher = publisher
+        frame = _companion_frame(0x8B, b"\x00" + b"\xaa" * 6 + b"\x00\x67\x00\xfa")
+        try:
+            with patch("mux.telemetry_mod.append_row") as append:
+                await self.companion.send(frame)
+                received = await asyncio.wait_for(
+                    read_frame(reader, COMPANION_START), timeout=2.0
+                )
+                self.assertEqual(received, frame)
+                append.assert_not_called()
+                publisher.publish_telemetry.assert_not_called()
+                self.assertFalse(self.mux._telemetry_received.is_set())
+        finally:
+            writer.close()
+
+    async def test_telemetry_processing_failure_still_forwards_response(self):
+        reader, writer = await self._connect_client()
+        try:
+            frame = _companion_frame(0x8B, b"\x00" + bytes(range(6)))
+            with patch.object(
+                self.mux,
+                "_handle_telemetry_response",
+                side_effect=ValueError("bad data"),
+            ), self.assertLogs("mux", level="ERROR"):
+                await self.companion.send(frame)
+                received = await asyncio.wait_for(
+                    read_frame(reader, COMPANION_START), timeout=2.0
+                )
+                self.assertEqual(received, frame)
+                self.assertTrue(self.mux._companion_ready.is_set())
+        finally:
+            writer.close()
+
+    async def test_short_telemetry_response_still_forwarded(self):
+        reader, writer = await self._connect_client()
+        try:
+            frame = _companion_frame(0x8B)
+            with self.assertLogs("mux", level="WARNING"):
+                await self.companion.send(frame)
+                received = await asyncio.wait_for(
+                    read_frame(reader, COMPANION_START), timeout=2.0
+                )
+                self.assertEqual(received, frame)
+        finally:
+            writer.close()
+
+    async def test_run_cancellation_stops_companion_loops(self):
+        reader, writer = await self._connect_client()
+        self.addAsyncCleanup(writer.wait_closed)
+        self.addCleanup(writer.close)
+        self.mux_task.cancel()
+        done, _ = await asyncio.wait([self.mux_task], timeout=1.0)
+        self.assertIn(self.mux_task, done, "mux shutdown did not finish")
+        with self.assertRaises(asyncio.CancelledError):
+            await self.mux_task
+        self.assertEqual(await asyncio.wait_for(reader.read(), timeout=1.0), b"")
+        self.assertFalse(self.mux._clients)
+        self.assertFalse(self.mux._companion_ready.is_set())
+        self.assertFalse(
+            [
+                task
+                for task in asyncio.all_tasks()
+                if task.get_coro().__qualname__
+                in (
+                    "MeshCoreMux._companion_read_loop",
+                    "MeshCoreMux._companion_write_loop",
+                )
+            ],
+            "companion child tasks leaked after shutdown",
+        )
 
     async def test_channel_info_forwarded_to_client_when_beacon_disabled(self):
         reader, writer = await self._connect_client()

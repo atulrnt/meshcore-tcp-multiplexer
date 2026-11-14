@@ -14,7 +14,7 @@ _CMD_SYNC_NEXT = 10  # SYNC_NEXT_MESSAGE — triggers stored-message replay
 _CMD_GET_CHANNEL = 0x1F  # GET_CHANNEL — request channel name/PSK
 _CMD_TELEMETRY_REQ = 0x27  # CMD_SEND_TELEMETRY_REQ — request repeater telemetry
 
-# Companion → client response types (consumed by mux, not forwarded)
+# Companion → client response types processed locally by the mux
 _RESP_CHANNEL_INFO = 0x12  # CHANNEL_INFO — response to GET_CHANNEL
 _RESP_TELEMETRY = 0x8B  # PUSH_CODE_TELEMETRY_RESPONSE — repeater telemetry
 
@@ -49,6 +49,7 @@ class MeshCoreMux:
         self._clients: set[asyncio.StreamWriter] = set()
         self._write_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=queue_depth)
         self._companion_ready: asyncio.Event = asyncio.Event()
+        self._telemetry_received: asyncio.Event = asyncio.Event()
 
     async def run(self) -> None:
         server = await asyncio.start_server(
@@ -65,7 +66,14 @@ class MeshCoreMux:
                 tasks.append(self._beacon_loop())
             if self._telemetry_pubkey:
                 tasks.append(self._telemetry_loop())
-            await asyncio.gather(*tasks)
+            try:
+                await asyncio.gather(*tasks)
+            finally:
+                # Server.wait_closed() also waits for accepted connections on
+                # Python 3.12+. Close clients before leaving the server context.
+                for writer in list(self._clients):
+                    writer.close()
+                self._clients.clear()
 
     # ------------------------------------------------------------------
     # Companion connection (with reconnect backoff)
@@ -94,6 +102,7 @@ class MeshCoreMux:
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         self._companion_ready.set()
+        tasks: list[asyncio.Task] = []
         try:
             if self._beacon:
                 try:
@@ -104,30 +113,31 @@ class MeshCoreMux:
                 asyncio.create_task(self._companion_read_loop(reader)),
                 asyncio.create_task(self._companion_write_loop(writer)),
             ]
-            done, pending = await asyncio.wait(
-                tasks, return_when=asyncio.FIRST_EXCEPTION
-            )
-            for t in pending:
-                t.cancel()
-                try:
-                    await t
-                except (asyncio.CancelledError, Exception):
-                    pass
-            writer.close()
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
             for t in done:
                 exc = t.exception()
                 if exc:
                     raise exc
         finally:
             self._companion_ready.clear()
+            writer.close()
+            # Always reap both loops, including cancellation during asyncio.wait.
+            # Do not catch CancelledError here: shutdown must reach the caller.
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _companion_read_loop(self, reader: asyncio.StreamReader) -> None:
         while True:
             frame = await read_frame(reader, COMPANION_START)
             log.debug("companion → clients: %d bytes", len(frame))
             if len(frame) >= 4 and frame[3] == _RESP_TELEMETRY:
-                self._handle_telemetry_response(frame)
-                continue
+                try:
+                    self._handle_telemetry_response(frame)
+                except Exception:
+                    log.exception(
+                        "telemetry: local processing failed; forwarding response"
+                    )
             if self._beacon and len(frame) >= 4 and frame[3] == _RESP_CHANNEL_INFO:
                 self._log_channel_info(frame)
                 continue  # consumed by mux; not a live message for clients
@@ -230,8 +240,15 @@ class MeshCoreMux:
                     log.warning("telemetry: write queue full, dropped oldest frame")
                 except asyncio.QueueEmpty:
                     pass
+            self._telemetry_received.clear()
             await self._write_queue.put(frame)
             await asyncio.sleep(self._telemetry_refresh)
+            if self._companion_ready.is_set() and not self._telemetry_received.is_set():
+                log.warning(
+                    "telemetry: no response from %s within %ds of queued request",
+                    self._telemetry_pubkey.hex()[:12],  # type: ignore[union-attr]
+                    self._telemetry_refresh,
+                )
 
     def _build_telemetry_req_frame(self) -> bytes:
         payload = bytes([_CMD_TELEMETRY_REQ, 0x00, 0x00, 0x00]) + self._telemetry_pubkey  # type: ignore[operator]
@@ -244,17 +261,30 @@ class MeshCoreMux:
                 "telemetry: response too short (%d bytes), ignoring", len(frame)
             )
             return
-        pubkey_prefix = frame[5:11].hex()
+        prefix = frame[5:11]
+        if self._telemetry_pubkey and prefix != self._telemetry_pubkey[:6]:
+            log.debug(
+                "telemetry: ignoring local outputs for other node %s", prefix.hex()
+            )
+            return
+        self._telemetry_received.set()
+        pubkey_prefix = prefix.hex()
         lpp_data = frame[11:]
         fields = telemetry_mod.parse_lpp(lpp_data)
         log.debug("telemetry: response from %s fields=%r", pubkey_prefix, fields)
         if self._telemetry_csv:
-            telemetry_mod.append_row(
-                self._telemetry_csv, time.time(), pubkey_prefix, fields
-            )
+            try:
+                telemetry_mod.append_row(
+                    self._telemetry_csv, time.time(), pubkey_prefix, fields
+                )
+            except Exception:
+                log.exception("telemetry: CSV output failed for %s", pubkey_prefix)
         if self._mqtt_publisher:
-            self._mqtt_publisher.publish_telemetry(pubkey_prefix, fields)
-        log.info("telemetry: stored %d field(s) from %s", len(fields), pubkey_prefix)
+            try:
+                self._mqtt_publisher.publish_telemetry(pubkey_prefix, fields)
+            except Exception:
+                log.exception("telemetry: MQTT output failed for %s", pubkey_prefix)
+        log.info("telemetry: processed %d field(s) from %s", len(fields), pubkey_prefix)
 
     # ------------------------------------------------------------------
     # Beacon loop
