@@ -160,6 +160,7 @@ def main() -> None:
             port=args.mqtt_port,
             user=args.mqtt_user,
             password=args.mqtt_pass,
+            telemetry_refresh=args.telemetry_refresh * 60,
         )
         mqtt_publisher.connect()
 

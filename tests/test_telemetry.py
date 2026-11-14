@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from telemetry import MqttPublisher, append_row, parse_lpp
 
@@ -161,10 +162,12 @@ class FakeMqttClient:
 
 
 class TestMqttPublisher(unittest.TestCase):
+    def _publisher(self, **kwargs):
+        with patch("paho.mqtt.client.Client", return_value=FakeMqttClient()):
+            return MqttPublisher("broker.invalid", **kwargs)
+
     def test_publish_telemetry_uses_single_json_topic(self):
-        publisher = MqttPublisher.__new__(MqttPublisher)
-        publisher._client = FakeMqttClient()
-        publisher._discovered = set()
+        publisher = self._publisher()
 
         publisher.publish_telemetry(
             "aabbccdd",
@@ -184,18 +187,46 @@ class TestMqttPublisher(unittest.TestCase):
             {"temperature_c_ch0": 20.2, "battery_v_ch1": 4.11},
         )
         self.assertEqual(qos, 1)
-        self.assertTrue(retain)
+        self.assertFalse(retain)
 
     def test_discovery_reads_field_from_json_topic(self):
-        publisher = MqttPublisher.__new__(MqttPublisher)
-        publisher._client = FakeMqttClient()
+        publisher = self._publisher()
 
         publisher._publish_discovery("aabbccdd", "temperature_c_ch0")
 
         topic, payload, qos, retain = publisher._client.published[0]
-        self.assertEqual(topic, "homeassistant/sensor/meshcore_aabbccdd_temperature_c_ch0/config")
+        self.assertEqual(
+            topic, "homeassistant/sensor/meshcore_aabbccdd_temperature_c_ch0/config"
+        )
         self.assertEqual(qos, 1)
         self.assertTrue(retain)
         discovery = json.loads(payload)
         self.assertEqual(discovery["state_topic"], "meshcore/aabbccdd/telemetry")
-        self.assertEqual(discovery["value_template"], "{{ value_json.temperature_c_ch0 }}")
+        self.assertEqual(
+            discovery["value_template"], "{{ value_json.temperature_c_ch0 }}"
+        )
+        self.assertEqual(discovery["expire_after"], 900)
+
+    def test_discovery_expiry_tracks_refresh_seconds(self):
+        publisher = self._publisher(telemetry_refresh=120)
+        publisher._publish_discovery("aabbccdd", "battery_v_ch1")
+        discovery = json.loads(publisher._client.published[0][1])
+        self.assertEqual(discovery["expire_after"], 360)
+
+    def test_discovery_reannounced_after_reconnect(self):
+        publisher = self._publisher(telemetry_refresh=600)
+        fields = {"temperature_c_ch0": 20.2}
+        publisher.publish_telemetry("aabbccdd", fields)
+        publisher.publish_telemetry("aabbccdd", fields)
+        publisher._on_connect(publisher._client, None, None, 0, None)
+        publisher.publish_telemetry("aabbccdd", fields)
+        discoveries = [
+            message
+            for message in publisher._client.published
+            if message[0].endswith("/config")
+        ]
+        self.assertEqual(len(discoveries), 2)
+        for _, payload, qos, retain in discoveries:
+            self.assertEqual(json.loads(payload)["expire_after"], 1800)
+            self.assertEqual(qos, 1)
+            self.assertTrue(retain)

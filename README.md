@@ -40,7 +40,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-65 tests covering framing, store-and-forward, mux routing, telemetry parsing, and CLI argument handling. Integration tests use real in-process TCP.
+Tests cover framing, store-and-forward, mux routing and shutdown, telemetry parsing, MQTT discovery, and CLI argument handling. Integration tests use real in-process TCP.
 
 ### Code style
 
@@ -138,6 +138,10 @@ Results are stored in whichever outputs are configured:
 - **CSV** — when `--telemetry-csv FILE` is set, one row appended per fetch
 - **MQTT** — when `--mqtt-host` is set, each field published as a separate sensor (see below)
 
+Telemetry responses (`0x8B`) are processed locally **and forwarded unchanged to all TCP clients**, including malformed responses and responses from other nodes. A CSV or MQTT output error is logged without interrupting forwarding or the companion connection; the other output is still attempted. When a polling target is configured, only responses with its six-byte public-key prefix are written to local outputs. This prefix is the identity available in the legacy response, not full-key verification.
+
+If no matching response arrives within one refresh interval after a request is queued and the companion is connected, a warning is logged. This is a diagnostic only: requests are not retried early, and responses do not carry a request ID, so a client-triggered response from the same node also counts as received. Polling still uses `CMD_SEND_TELEMETRY_REQ` (`0x27`); binary replies (`0x8C`) are passed through without local parsing.
+
 ### Home Assistant integration
 
 The multiplexer implements [MQTT Discovery](https://www.home-assistant.io/integrations/mqtt/#mqtt-discovery), so entities appear automatically in Home Assistant without any YAML configuration.
@@ -179,7 +183,21 @@ Find the device under **Settings → Devices & Services → MQTT → Devices**.
 | Topic | Content |
 |---|---|
 | `homeassistant/sensor/meshcore_<pubkey>_<field>/config` | HA discovery payload (retained) |
-| `meshcore/telemetry/<pubkey>/<field>` | Latest sensor value (retained) |
+| `meshcore/<pubkey>/telemetry` | JSON object containing the latest telemetry fields (not retained, QoS 1) |
+
+Discovery includes `expire_after` set to **three times the configured refresh interval in seconds**. With the default five-minute interval this is 900 seconds; after that long without an update, Home Assistant marks the sensors unavailable. This describes telemetry freshness, not companion or repeater connectivity. Direct `MqttPublisher` callers may pass `telemetry_refresh` in seconds; omitting it keeps the five-minute default.
+
+Discovery stays retained, but telemetry state is deliberately **not retained**: replaying an old retained measurement when Home Assistant reconnects would restart its expiry timer and make stale data look fresh. After Home Assistant restarts or reconnects, sensors may therefore have no current value until the next live telemetry response.
+
+#### Upgrading from retained telemetry state
+
+Non-retained publishing does **not** remove state already retained by the broker. As a one-time migration, remove the old retained message for each exact `meshcore/<pubkey>/telemetry` topic (using its six-byte prefix, 12 hex characters), for example with your broker's authenticated client:
+
+```bash
+mosquitto_pub -h BROKER -t 'meshcore/PUBKEY_PREFIX/telemetry' -q 1 -r -n
+```
+
+Substitute the actual broker and prefix and supply authentication through your normal secure client configuration. Do not delete the retained discovery topics. Older installations using per-field state topics under `meshcore/telemetry/<pubkey>/<field>` should clear those obsolete retained state topics too. Restart/reload the Home Assistant MQTT integration after clearing stale state if it has already consumed it. Updated discovery replaces the existing sensor config on the next live response after the multiplexer restarts; entity unique IDs are unchanged. A node that never responds again will not get updated discovery until it does, so update its discovery manually if immediate expiry is needed.
 
 ## Protocol
 
